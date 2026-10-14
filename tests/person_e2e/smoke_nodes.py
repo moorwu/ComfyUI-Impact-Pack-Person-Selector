@@ -264,10 +264,67 @@ def test_v2b_review_fixes():
     check(not p1.mask[60:110, 440:500].any() and bool(p1.mask[108, 300]), "neighbour mask excludes faceless person's head (F2 via head)")
 
 
+class FakeSAM:
+    def __init__(self, masks):
+        self.sam_wrapper = self
+        self.masks = masks
+        self.prepared = False
+        self.released = False
+
+    def prepare_device(self):
+        self.prepared = True
+
+    def release_device(self):
+        self.released = True
+
+    def predict(self, image, points, labels, box, threshold):
+        return self.masks
+
+
+def test_overlapping_bodies_and_sam_alternatives():
+    image = make_image()
+    boxes = [((100, 50, 350, 390), 0.9), ((250, 50, 500, 390), 0.9)]
+    bodies = FakeDetector(boxes, "person")
+    faces = FakeDetector([((150, 60, 190, 100), 0.9), ((410, 60, 450, 100), 0.9)], "face")
+    numbered = _detect(image, bodies, faces)
+    check(not (numbered[0].mask & numbered[1].mask).any(), "overlapping bbox bodies have no shared pixels")
+    check(numbered[0].mask[300, 260] and numbered[1].mask[300, 340], "body overlap assigned to distinct people")
+
+    own_a, own_b = _mask((140, 50, 300, 390)), _mask((300, 50, 460, 390))
+    sam = FakeSAM([own_a | own_b, own_a, own_b])
+    numbered = _detect(image, bodies, faces, sam_model=sam)
+    check(sam.prepared and sam.released, "SAM device prepared and released")
+    check(np.array_equal(numbered[0].mask, own_a) and np.array_equal(numbered[1].mask, own_b),
+          "SAM merged-group candidate rejected; individual alternatives kept")
+    for p in numbered:
+        check(np.array_equal(pn._full_mask(p.person_seg, H, W), p.mask), "exported SEG matches exclusive preview mask")
+
+    # Invalid SAM prompts fall back to the detector, which must still be exclusive.
+    sam = FakeSAM([own_a | own_b])
+    numbered = _detect(image, bodies, faces, sam_model=sam)
+    check(not (numbered[0].mask & numbered[1].mask).any(), "SAM fallback does not restore body overlap")
+
+    # A person with no identifiable pixels must not regain the original merged mask.
+    merged = _mask((200, 100, 300, 390))
+    segm = FakeSegmDetector([(box, conf, merged) for box, conf in boxes])
+    numbered = _detect(image, ExplodingDetector(), FakeDetector([], "face"), person_segm_detector=segm)
+    check(sum(int(p.mask.any()) for p in numbered) == 1, "empty exclusive body is kept empty")
+    check(not (numbered[0].mask & numbered[1].mask).any(), "empty-body fallback never reintroduces merged people")
+
+    sam = FakeSAM([np.ones((10, 10), dtype=bool)])
+    try:
+        pn._sam_masks(sam, image, [([(170, 80)], [1], boxes[0][0])])
+    except ValueError:
+        check(sam.released, "SAM device released after an invalid prediction")
+    else:
+        raise AssertionError("expected invalid SAM shape to raise")
+
+
 if __name__ == "__main__":
     test_detector()
     test_selector()
     test_v2_segm_masks_exclusive_tint_and_grayout()
     test_v2b_extra_detector_merge_and_head_anchor()
     test_v2b_review_fixes()
+    test_overlapping_bodies_and_sam_alternatives()
     print("SMOKE OK")

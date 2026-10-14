@@ -85,11 +85,8 @@ def _sam_masks(sam_model, image: torch.Tensor, prompts) -> list[np.ndarray | Non
     try:
         results = []
         for points, labels, box in prompts:
-            merged = None
-            for m in sam_obj.predict(img, points, labels, list(box), _SAM_THRESHOLD):
-                m = np.asarray(m).astype(bool)
-                merged = m if merged is None else (merged | m)
-            results.append(merged if merged is not None and merged.any() else None)
+            masks = sam_obj.predict(img, points, labels, list(box), _SAM_THRESHOLD)
+            results.append(pc.select_sam_mask(masks, points, labels, box, img.shape[:2]))
         return results
     finally:
         sam_obj.release_device()
@@ -190,7 +187,8 @@ class PersonDetectorSEGS:
                 person_items.append(seg)
                 person_masks.append(mask)
 
-        cands = pc.associate([to_det(s) for s in person_items], [to_det(s) for s in face_items], w, h)
+        cands = pc.associate([to_det(s) for s in person_items], [to_det(s) for s in face_items], w, h,
+                             person_masks=person_masks)
         pc.assign_heads(cands, [to_det(s) for s in head_items])
 
         gray = image[0].cpu().numpy().mean(axis=2) * 255.0
@@ -223,14 +221,16 @@ class PersonDetectorSEGS:
                 if sam_mask is not None:
                     base_masks[k] = sam_mask
                     refined[k] = True
+                else:
+                    logger.warning("[Impact Pack] Person Detector: person #%d has no SAM mask satisfying its prompts; keeping the detector mask", numbered[k].index)
         synthetic = [c.person_det is None and not refined[k] for k, c in enumerate(numbered)]
-        final_masks = pc.exclusive_masks(base_masks, [pc.anchor_box(c) for c in numbered], synthetic)
+        final_masks = pc.exclusive_masks(base_masks, [pc.anchor_box(c) for c in numbered], synthetic,
+                                        preserve_contours=person_segm_detector is not None or sam_model is not None)
 
         persons = []
-        for c, base, mask in zip(numbered, base_masks, final_masks):
+        for c, mask in zip(numbered, final_masks):
             if not mask.any():
-                logger.warning("[Impact Pack] Person Detector: person #%d mask became empty after overlap removal; keeping the unclipped mask", c.index)
-                mask = base
+                logger.warning("[Impact Pack] Person Detector: person #%d has no exclusive body pixels; its body mask is empty", c.index)
             persons.append(Person(c.index, _with_mask(body_seg(c), mask), face_seg(c), c.person_box, c.face_box,
                                   c.area_ratio, c.sharpness, None, mask, head_bbox=c.head_box))
         for c in excluded:

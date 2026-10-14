@@ -174,8 +174,23 @@ def anchor(c: PersonCandidate) -> tuple[float, float]:
     return _center(box) if box is not None else _center(c.person_box)
 
 
-def associate(persons: list[Detection], faces: list[Detection], image_w: int, image_h: int) -> list[PersonCandidate]:
+def associate(persons: list[Detection], faces: list[Detection], image_w: int, image_h: int,
+              person_masks: list[np.ndarray] | None = None) -> list[PersonCandidate]:
+    if person_masks is not None and (len(person_masks) != len(persons)
+                                    or any(np.asarray(m).shape != (image_h, image_w) for m in person_masks)):
+        raise ValueError("associate: person_masks must contain one full-image mask per person")
     cands = [PersonCandidate(person_box=p.bbox, confidence=p.confidence, person_det=i) for i, p in enumerate(persons)]
+
+    def mask_rank(pi: int, face: Box) -> tuple[float, float]:
+        if person_masks is None:
+            return 0.0, 0.0
+        mask = np.asarray(person_masks[pi])
+        cx, cy = _center(face)
+        x1, y1 = max(0, face[0]), max(0, face[1])
+        x2, y2 = min(image_w, face[2]), min(image_h, face[3])
+        region = mask[y1:y2, x1:x2] > 0.5
+        centre_inside = mask[min(image_h - 1, max(0, int(cy))), min(image_w - 1, max(0, int(cx)))] > 0.5
+        return -float(centre_inside), -float(region.mean()) if region.size else 0.0
 
     claimed: dict[int, list[int]] = {}
     orphans: list[int] = []
@@ -187,7 +202,8 @@ def associate(persons: list[Detection], faces: list[Detection], image_w: int, im
         face_area = max(box_area(face.bbox), 1)
         best = min(
             eligible,
-            key=lambda pi: (-_intersection_area(face.bbox, persons[pi].bbox) / face_area, box_area(persons[pi].bbox)),
+            key=lambda pi: (*mask_rank(pi, face.bbox),
+                            -_intersection_area(face.bbox, persons[pi].bbox) / face_area, box_area(persons[pi].bbox)),
         )
         claimed.setdefault(best, []).append(fi)
 
@@ -278,14 +294,19 @@ def _box_region(h: int, w: int, box: Box | None) -> np.ndarray:
 
 
 def exclusive_masks(masks: list[np.ndarray], face_boxes: list[Box | None], synthetic: list[bool],
-                    face_margin: float = 0.15) -> list[np.ndarray]:
-    """Full-image (H, W) bool masks, one per numbered person, in the same order as face_boxes/synthetic."""
+                    face_margin: float = 0.15, preserve_contours: bool = False) -> list[np.ndarray]:
+    """Disjoint full-image masks. Protect anchors, prefer detected bodies over synthetic
+    rectangles, then give shared pixels to the nearest face/head (mask centre if absent).
+    This resolves ownership only; silhouettes still require an instance detector or SAM.
+    """
     if not len(masks) == len(face_boxes) == len(synthetic):
         raise ValueError(f"exclusive_masks: masks, face_boxes and synthetic must have the same length "
                          f"(got {len(masks)}, {len(face_boxes)}, {len(synthetic)})")
     if not masks:
         return []
     h, w = masks[0].shape
+    if any(np.asarray(m).shape != (h, w) for m in masks):
+        raise ValueError("exclusive_masks: all masks must have the same (H, W) shape")
     own_faces = [_box_region(h, w, fb) for fb in face_boxes]
     expanded_faces = [_box_region(h, w, None if fb is None else expand_box(fb, face_margin, w, h)) for fb in face_boxes]
     bodies = [np.asarray(m).astype(bool) for m in masks]
@@ -296,10 +317,48 @@ def exclusive_masks(masks: list[np.ndarray], face_boxes: list[Box | None], synth
         for j in range(len(bodies)):
             if j == i:
                 continue
-            m &= ~(expanded_faces[j] & ~own_faces[i])
-            if synthetic[i]:
+            foreign_face = expanded_faces[j]
+            if preserve_contours and not synthetic[i] and not synthetic[j]:
+                # A neighbour's face box can extend into this person's valid hair/arm.
+                # For silhouettes, carve only pixels actually claimed by both masks.
+                foreign_face = foreign_face & bodies[j]
+            m &= ~(foreign_face & ~own_faces[i])
+            if synthetic[i] and not synthetic[j]:
                 m &= ~(bodies[j] & ~own_faces[i])
         out.append(m)
+
+    counts = np.zeros((h, w), dtype=np.int32)
+    for m in out:
+        counts += m
+    ys, xs = np.nonzero(counts > 1)
+    if not len(xs):
+        return out
+
+    centres = []
+    for i, body in enumerate(bodies):
+        if face_boxes[i] is not None:
+            centres.append(_center(face_boxes[i]))
+        else:
+            by, bx = np.nonzero(body)
+            centres.append(((float(bx.min()) + float(bx.max())) / 2,
+                            (float(by.min()) + float(by.max())) / 2) if len(bx) else (0.0, 0.0))
+
+    # Work only on shared pixels, without allocating an N x H x W distance tensor.
+    owners = np.full(len(xs), -1, dtype=np.int32)
+    best_priority = np.full(len(xs), 3, dtype=np.int8)
+    best_distance = np.full(len(xs), np.inf)
+    order = sorted(range(len(out)), key=lambda i: (centres[i], synthetic[i], int(bodies[i].sum())))
+    for i in order:
+        cx, cy = centres[i]
+        distance = (xs - cx) ** 2 + (ys - cy) ** 2
+        priority = np.where(own_faces[i][ys, xs], 0, 2 if synthetic[i] else 1)
+        take = out[i][ys, xs] & ((priority < best_priority)
+                                | ((priority == best_priority) & (distance < best_distance)))
+        owners[take] = i
+        best_priority[take] = priority[take]
+        best_distance[take] = distance[take]
+    for i, m in enumerate(out):
+        m[ys, xs] = owners == i
     return out
 
 
@@ -318,15 +377,39 @@ def sam_prompts(target_body: Box, target_face: Box | None, other_faces: list[Box
     own = target_face if target_face is not None else target_head
     points = [_center(own) if own is not None else _center(target_body)]
     labels = [1]
-    x1, y1, x2, y2 = target_body
     for face in other_faces:
         cx, cy = _center(face)
-        if own is not None and _contains_point(own, (cx, cy)):
+        if (cx, cy) == points[0] or (own is not None and _contains_point(own, (cx, cy))):
             continue  # a negative inside the target's own face/head would fight the positive point
-        if x1 <= cx <= x2 and y1 <= cy <= y2:
-            points.append((cx, cy))
-            labels.append(0)
+        # A neighbour's head may lie outside this box while their torso/arm overlaps it.
+        # Keep that negative too, so a merged-person SAM alternative can be rejected.
+        points.append((cx, cy))
+        labels.append(0)
     return points, labels, target_body
+
+
+def select_sam_mask(masks, points: list[tuple[float, float]], labels: list[int],
+                    box: Box, image_shape: tuple[int, int]) -> np.ndarray | None:
+    """SAM multimasks are alternatives, not separate parts of a person. Pick a single
+    mask containing positive prompts and excluding negative prompts; reject merged people.
+    Prefer the largest valid candidate to avoid choosing just the face over the body.
+    """
+    h, w = image_shape
+    region = _box_region(h, w, box)
+    samples = [(min(w - 1, max(0, int(x))), min(h - 1, max(0, int(y))), label)
+               for (x, y), label in zip(points, labels)]
+    best, best_area = None, 0
+    for candidate in masks:
+        m = np.asarray(candidate) > 0.5
+        if m.shape != (h, w):
+            raise ValueError(f"Person Detector: SAM mask shape {m.shape} does not match image {(h, w)}")
+        if any(bool(m[y, x]) != bool(label) for x, y, label in samples):
+            continue
+        m = m & region
+        area = int(m.sum())
+        if area > best_area:
+            best, best_area = m, area
+    return best
 
 
 # ---------------------------------------------------------------- multi-detector merge & heads (v2, F7)

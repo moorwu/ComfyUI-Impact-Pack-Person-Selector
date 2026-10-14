@@ -295,7 +295,8 @@ def test_exclusive_masks_remove_other_faces_but_keep_own_face():
     assert not out[0][10:30, 110:120].any()           # B's face removed from A
     assert out[0][10:30, 40:60].all()                 # A keeps its own face
     assert out[1][10:30, 110:130].all()               # B keeps its own face
-    assert out[1][50:100, 100:120].all()              # non-synthetic masks don't subtract other bodies
+    assert out[1][50:100, 100:120].all()              # shared body pixels are nearer B's face
+    assert not (out[0] & out[1]).any()               # bodies, not just faces, must be exclusive
 
 
 def test_exclusive_masks_synthetic_subtracts_other_bodies():
@@ -333,15 +334,20 @@ def test_others_mask_excludes_own_pixels():
 
 # ---------- v2: F6 SAM prompts ----------
 
-def test_sam_prompts_face_positive_and_inside_negatives():
+def test_sam_prompts_include_neighbours_outside_body_box():
     points, labels, box = pc.sam_prompts((0, 0, 200, 400), (80, 20, 120, 60), [(150, 30, 190, 70), (300, 30, 340, 70)])
-    assert points == [(100.0, 40.0), (170.0, 50.0)]
-    assert labels == [1, 0]
+    assert points == [(100.0, 40.0), (170.0, 50.0), (320.0, 50.0)]
+    assert labels == [1, 0, 0]
     assert box == (0, 0, 200, 400)
 
 
 def test_sam_prompts_without_face_uses_body_center():
     points, labels, _ = pc.sam_prompts((0, 0, 100, 300), None, [])
+    assert points == [(50.0, 150.0)] and labels == [1]
+
+
+def test_sam_prompts_do_not_negate_faceless_positive_point():
+    points, labels, _ = pc.sam_prompts((0, 0, 100, 300), None, [(40, 140, 60, 160)])
     assert points == [(50.0, 150.0)] and labels == [1]
 
 
@@ -533,3 +539,144 @@ def test_sam_prompts_skips_negative_inside_own_anchor():
     assert labels == [1, 0]
     points, labels, _ = pc.sam_prompts((0, 0, 400, 800), None, [inside_own], target_head=own_face)
     assert points == [(150.0, 150.0)] and labels == [1]
+
+
+# ---------- overlapping body ownership and SAM alternatives ----------
+
+def test_overlapping_bodies_split_without_losing_unique_silhouette():
+    a = _rect(100, 160, (0, 0, 100, 100))
+    b = _rect(100, 160, (60, 0, 160, 100))
+    originals = [a.copy(), b.copy()]
+    out = pc.exclusive_masks([a, b], [(20, 5, 40, 25), (120, 5, 140, 25)], [False, False])
+    assert not (out[0] & out[1]).any()
+    assert out[0][:, :60].all() and out[1][:, 100:].all()
+    assert out[0][50:, 60:80].all() and out[1][50:, 81:100].all()
+    assert np.array_equal(out[0] | out[1], a | b)
+    assert np.array_equal(a, originals[0]) and np.array_equal(b, originals[1])
+
+
+def test_three_identical_group_masks_split_by_distinct_anchors():
+    body = np.ones((60, 120), dtype=bool)
+    faces = [(10, 0, 20, 10), (55, 0, 65, 10), (100, 0, 110, 10)]
+    out = pc.exclusive_masks([body] * 3, faces, [False] * 3)
+    assert np.array_equal(sum(m.astype(int) for m in out), np.ones(body.shape))
+    assert all(m.any() for m in out)
+    assert out[0][40, 15] and out[1][40, 60] and out[2][40, 105]
+    # Numbering/sort order must not decide which person owns an overlap.
+    reverse = pc.exclusive_masks([body] * 3, faces[::-1], [False] * 3)
+    assert all(np.array_equal(a, b) for a, b in zip(out, reverse[::-1]))
+
+
+def test_overlapping_anchors_still_have_single_pixel_owners():
+    body = np.ones((60, 100), dtype=bool)
+    out = pc.exclusive_masks([body, body], [(20, 5, 60, 25), (40, 5, 80, 25)], [False, False])
+    assert not (out[0] & out[1]).any()
+    assert out[0][15, 40] and out[1][15, 60]
+
+
+def test_faceless_body_overlap_uses_mask_centres():
+    a, b = _rect(50, 100, (0, 0, 70, 50)), _rect(50, 100, (30, 0, 100, 50))
+    out = pc.exclusive_masks([a, b], [None, None], [False, False])
+    assert not (out[0] & out[1]).any()
+    assert out[0][25, 40] and out[1][25, 60]
+
+
+def test_synthetic_rectangles_split_instead_of_erasing_each_other():
+    body = np.ones((60, 100), dtype=bool)
+    out = pc.exclusive_masks([body, body], [(10, 0, 20, 10), (80, 0, 90, 10)], [True, True])
+    assert out[0][40, 15] and out[1][40, 85]
+    assert not (out[0] & out[1]).any()
+
+
+def test_fully_covered_synthetic_mask_stays_empty():
+    real, synth = np.ones((50, 100), dtype=bool), _rect(50, 100, (30, 10, 70, 40))
+    out = pc.exclusive_masks([real, synth], [None, None], [False, True])
+    assert out[0].all() and not out[1].any()
+
+
+def test_exclusive_masks_mismatched_shapes_raise():
+    with pytest.raises(ValueError, match="shape"):
+        pc.exclusive_masks([np.ones((10, 10)), np.ones((20, 10))], [None, None], [False, False])
+
+
+def test_sam_rejects_group_mask_and_keeps_single_body():
+    own = _rect(60, 100, (5, 0, 45, 60))
+    merged = own | _rect(60, 100, (55, 0, 95, 60))
+    chosen = pc.select_sam_mask([merged, own], [(25, 10), (75, 10)], [1, 0], (0, 0, 100, 60), (60, 100))
+    assert np.array_equal(chosen, own)
+
+
+def test_sam_alternatives_are_not_unioned():
+    a = _rect(60, 100, (5, 0, 45, 60))
+    b = _rect(60, 100, (15, 0, 55, 50))
+    chosen = pc.select_sam_mask([a, b], [(25, 10)], [1], (0, 0, 100, 60), (60, 100))
+    assert np.array_equal(chosen, a)
+    assert not chosen[:, 45:55].any()
+
+
+def test_sam_prefers_full_body_over_face_only():
+    face, body = _rect(60, 100, (10, 0, 30, 20)), _rect(60, 100, (0, 0, 40, 60))
+    chosen = pc.select_sam_mask([face, body], [(20, 10)], [1], (0, 0, 100, 60), (60, 100))
+    assert np.array_equal(chosen, body)
+
+
+def test_sam_invalid_or_empty_candidates_fall_back():
+    group = np.ones((60, 100), dtype=bool)
+    for masks in ([], [group], [np.zeros_like(group)]):
+        assert pc.select_sam_mask(masks, [(25, 10), (75, 10)], [1, 0], (0, 0, 100, 60), (60, 100)) is None
+
+
+def test_sam_mask_is_clipped_to_target_body_box():
+    full = np.ones((60, 100), dtype=bool)
+    chosen = pc.select_sam_mask([full], [(20, 10)], [1], (10, 0, 40, 60), (60, 100))
+    assert np.array_equal(chosen, _rect(60, 100, (10, 0, 40, 60)))
+
+
+def test_sam_mask_shape_mismatch_raises():
+    with pytest.raises(ValueError, match="SAM mask shape"):
+        pc.select_sam_mask([np.ones((20, 30))], [(5, 5)], [1], (0, 0, 100, 60), (60, 100))
+
+
+def test_face_association_uses_silhouettes_when_body_boxes_overlap():
+    persons = [D((0, 0, 120, 200), .9), D((40, 0, 120, 160), .8)]
+    faces = [D((60, 10, 80, 30), .9), D((90, 10, 110, 30), .8)]
+    masks = [_rect(200, 120, (0, 0, 85, 200)), _rect(200, 120, (85, 0, 120, 160))]
+    # Both faces fit the smaller box, but only one belongs to its silhouette.
+    cands = pc.associate(persons, faces, 120, 200, person_masks=masks)
+    assert len(cands) == 2
+    assert [c.face_det for c in cands] == [0, 1]
+    assert all(c.person_det is not None for c in cands)
+
+
+def test_face_association_with_rectangles_keeps_bbox_behaviour():
+    persons = [D((0, 0, 120, 200), .9), D((40, 0, 120, 160), .8)]
+    faces = [D((60, 10, 80, 30), .9)]
+    masks = [_rect(200, 120, p.bbox) for p in persons]
+    cands = pc.associate(persons, faces, 120, 200, person_masks=masks)
+    assert cands[1].face_det == 0 and cands[0].face_det is None
+
+
+def test_face_association_rejects_mismatched_masks():
+    persons = [D((0, 0, 10, 20), .9)]
+    with pytest.raises(ValueError, match="person_masks"):
+        pc.associate(persons, [], 10, 20, person_masks=[])
+    with pytest.raises(ValueError, match="person_masks"):
+        pc.associate(persons, [], 10, 20, person_masks=[np.ones((10, 10))])
+
+
+def test_disjoint_silhouettes_keep_hair_inside_neighbours_face_margin():
+    a = _rect(100, 120, (0, 0, 60, 100))
+    b = _rect(100, 120, (60, 0, 120, 100))
+    anchors = [(20, 20, 50, 50), (60, 20, 90, 50)]
+    out = pc.exclusive_masks([a, b], anchors, [False, False], preserve_contours=True)
+    assert np.array_equal(out[0], a) and np.array_equal(out[1], b)
+
+
+def test_preserving_contours_still_removes_actual_face_and_body_overlap():
+    a = _rect(100, 120, (0, 0, 80, 100))
+    b = _rect(100, 120, (60, 0, 120, 100))
+    out = pc.exclusive_masks([a, b], [(20, 10, 40, 30), (65, 10, 85, 30)],
+                             [False, False], preserve_contours=True)
+    assert not (out[0] & out[1]).any()
+    assert not out[0][10:30, 65:80].any()
+    assert out[1][10:30, 65:85].all()

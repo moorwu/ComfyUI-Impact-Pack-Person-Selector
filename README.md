@@ -93,16 +93,41 @@ Every image below was produced by `example_workflows/person_detailer.json` on th
 
 Faces that are in profile, heavily occluded, or only a few dozen pixels across are this node pack's weak spot, as they are for `FaceDetailer` itself. Lower the `denoise`, write a prompt that does not demand features the crop cannot show, or leave those people out of the selection.
 
+## Overlapping people: fixes and current limits
+
+Body masks now assign shared pixels to a single numbered person, keep empty results empty, and associate faces with silhouette coverage before box overlap. SAM alternatives are selected individually instead of being unioned. These changes prevent the node from reintroducing shared masks; geometry alone does not recover the true boundary between intertwined arms or legs.
+
+On a downloaded hugging photo, `person_yolov8m-seg.pt` returned one body for two detected faces. Connecting `person_segm_detector` therefore does not guarantee separate people, and SAM 1 refinement did not resolve this example. We tested [SAM 3](https://github.com/facebookresearch/sam3) separately with `man` and `woman` text prompts: both photos below produced two visible silhouettes. The script feeds those masks into the actual Detector → Selector nodes and verifies zero shared pixels and unchanged exported masks. This is a segmentation experiment, not a Detailer redraw or a built-in SAM 3 provider; SAM 3 cannot be connected through the existing `SAMLoader` by following this example.
+
+Left to right: original, Detector preview, person 1, person 2. Occluded body parts remain absent; the second photo has small edge fragments. No ground-truth pixel accuracy benchmark was performed.
+
+![Hugging pair: bent legs and crossing arms separated by SAM 3](docs/images/person-overlap-sam3-first.jpg)
+
+![Hugging pair: separate bodies with only one visible face](docs/images/person-overlap-sam3-second.jpg)
+
+Photo sources: [first image](https://images.unsplash.com/photo-1575216525169-112eb232f906?auto=format&fit=max&w=1600&q=90), [second image](https://images.unsplash.com/photo-1741217531361-b9f5ecbb6fe2?auto=format&fit=max&w=1600&q=90), downloaded from Unsplash on 2026-10-13. These are separate from the repository's fixture examples above.
+
+To reproduce, prepare SAM 3 source, its `sam3.pt` checkpoint and dependencies according to the official repository, plus a ComfyUI environment containing `models/ultralytics/bbox/face_yolov8m.pt`. From this repository root, run:
+
+```bash
+python tests/person_e2e/sam3_person_check.py \
+  --image /path/to/photo.jpg --checkpoint /path/to/sam3.pt \
+  --sam3-root /path/to/sam3 --comfy-root /path/to/ComfyUI \
+  --output /path/to/results --device cpu --prompts man woman
+```
+
+The [verification script](tests/person_e2e/sam3_person_check.py) saves masks, cutouts, a comparison and `report.json`. CPU mode applies three compatibility guards to an isolated copy of the SAM 3 source, without editing installed packages. Use `--device cuda` for an environment with sufficient GPU memory. The two concept prompts are specific to these photos; other scenes may need different descriptions and visual checking.
+
 ## Person nodes reference
 
   * `Person Detector (SEGS)` - Detects every person and every face in the image, associates each face with the body it belongs to (or synthesizes an approximate body box for an orphan face), excludes people who are too small, too far in the background, or too blurry, and numbers the rest left-to-right (configurable via `sort_by`).
     * Required: `image`, `person_detector` and `face_detector` (both `BBOX_DETECTOR`, e.g. `UltralyticsDetectorProvider` with `segm/person_yolov8m-seg.pt` and `bbox/face_yolov8m.pt`). One shared `threshold` applies to all connected detectors (body, SEGM, extra person, head, face).
     * Optional `person_segm_detector` (`SEGM_DETECTOR`, e.g. the `SEGM_DETECTOR` output of the same `UltralyticsDetectorProvider` used for `person_detector`): when connected, body detection switches to instance segmentation, so each person's full-body region is their actual silhouette instead of a rectangle; it replaces `person_detector`, which is then ignored.
     * Optional `extra_person_detector` (`BBOX_DETECTOR`) and `head_detector` (`BBOX_DETECTOR`): `extra_person_detector` is an additional body detector run first (recommended: `bbox/person_detect_v1.1_m.pt` for anime/illustrated people); `person_segm_detector`/`person_detector` boxes only backfill people it missed. `head_detector` (recommended: `bbox/head_detect_v2.0_s_yv11.pt`) detects heads and anchors numbering, preview labels and SAM prompts for people whose face isn't visible; when connected, it also changes what `min_relative_size` compares. Both models are from Hugging Face user [deepghs](https://huggingface.co/deepghs) (MIT license) - download them into `models/ultralytics/bbox/` and add their filenames to `ComfyUI/user/default/ComfyUI-Impact-Subpack/model-whitelist.txt` so `UltralyticsDetectorProvider` will load them.
-    * Optional `sam_model` (`SAM_MODEL`): runs SAM once per numbered person to refine their body mask, using that person's face (or head, if no face is visible) as the positive point and the faces (or heads) of other people whose face falls inside their body box as negative points; a negative point that falls inside the person's own face/head region is skipped so SAM isn't told to exclude the person's own face.
+    * Optional `sam_model` (`SAM_MODEL`): refines each numbered person's body mask using their face (or head) as a positive point and other numbered people's faces/heads as negatives, including neighbours outside the body box whose limbs may overlap it. Negatives inside the person's own anchor are skipped. SAM alternatives are never unioned: the largest candidate satisfying all prompt points is selected and clipped to the body box; if none qualifies, the detector mask is used.
     * Exclusion thresholds and defaults: `min_person_ratio` 0.015 (body box area vs. whole image), `min_relative_size` 0.31 (filters background bystanders - decided per person: head short side vs. the largest head's if a head was detected for that person, else face short side vs. the largest face's, else sqrt of body area vs. the largest person's), `min_face_size` 24px (face box short side), `min_sharpness` 0 = off (Laplacian variance of the face crop, filters blurry background people).
     * Saved v1 workflows keep their old widget values (`min_person_ratio` 0.02, `min_relative_size` 0.25); with the new linear size measure, update them to 0.015 / 0.31.
-    * Outputs `persons` (`PERSONS`, feeds `Person Selector`) and `preview` (`IMAGE`): each numbered person's full-body mask is overlaid on the image, semi-transparent, tinted with that person's number color, with the number label placed above their face (or head); a numbered person's mask automatically removes the (15%-expanded) face region - or head region, when the face isn't visible - of every other *numbered* person, so overlapping bodies don't bleed into each other; excluded people are not subtracted. Excluded people get a gray box instead of a mask, tagged `xS` (small), `xBG` (background), `xF` (tiny face) or `xB` (blurry).
+    * Outputs `persons` (`PERSONS`, feeds `Person Selector`) and `preview` (`IMAGE`): each numbered person's body mask is tinted in their number's colour, with the label above their face/head. Masks remove neighbours' 15%-expanded face/head regions; for two detected silhouettes, only pixels also claimed by the neighbour are removed, preserving valid hair and arms. Remaining shared body pixels are assigned to one person, prioritizing own anchors and detected bodies over synthetic rectangles, then the nearest face/head (mask centre if absent). Faces are associated using silhouette coverage before box overlap. An empty body mask stays empty; its face remains selectable. This geometric fallback cannot infer true occlusion boundaries from rectangles alone. Excluded people are not subtracted and get gray boxes tagged `xS` (small), `xBG` (background), `xF` (tiny face) or `xB` (blurry).
     * Numbering (`sort_by`): the default `left_to_right` orders people by their face center, falling back to head center when there's no face, and to body-box center when there's neither.
   * `Person Selector` - Selects a subset of the numbered people from `Person Detector (SEGS)` and outputs their face and body regions as SEGS, ready for `Detailer (SEGS)`.
     * `index`: comma-separated numbers starting at 1, e.g. `2`, `1,3`, `2-4`, or `-1` for the last person; empty selects everyone.
