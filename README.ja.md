@@ -93,16 +93,41 @@ LoadImage ───────────────────────�
 
 横顔、大きく隠れた顔、数十ピクセルしかない小さな顔は、このノードパックの弱点です（本家の `FaceDetailer` でも同様です）。`denoise` を下げる、切り抜きに写っていない特徴をプロンプトで要求しない、あるいはその人物を選択から外す、といった対処をしてください。
 
+## 人物の重なり：修正内容と制限
+
+身体の共有画素を一人の採番済み人物に割り当て、空のマスクは空のまま保持します。顔と身体の対応付けでは輪郭の被覆をボックスの重なりより優先し、SAM の候補は合成せず一つ選びます。共有マスクの再導入を防ぎますが、幾何的な分配だけでは絡み合った腕や脚の正しい境界は推定できません。
+
+ダウンロードした抱き合う写真では、`person_yolov8m-seg.pt` が二つの顔に対して一つの身体を返しました。`person_segm_detector` の接続だけで必ず二人に分かれるわけではなく、SAM 1 の精密化でもこの例は解決しませんでした。別途 [SAM 3](https://github.com/facebookresearch/sam3) に `man` と `woman` を指定すると、下の二枚で可視部分の輪郭を分離できました。スクリプトは実際の Detector → Selector にマスクを渡し、共有画素が 0 で出力マスクが一致することを検証します。これは分割実験であり、内蔵の SAM 3 プロバイダーや Detailer の描き直しではありません。既存の `SAMLoader` からこの手順で SAM 3 を接続することはできません。
+
+左から元画像、Detector プレビュー、人物 1、人物 2。隠れた身体は補完しません。二枚目には小さな輪郭の断片が残り、画素単位の正解データによる精度評価は行っていません。
+
+![抱き合う二人：曲げた脚と交差する腕を SAM 3 で分離](docs/images/person-overlap-sam3-first.jpg)
+
+![顔が一つしか見えない写真でも二つの身体マスクを出力](docs/images/person-overlap-sam3-second.jpg)
+
+画像出典：[一枚目](https://images.unsplash.com/photo-1575216525169-112eb232f906?auto=format&fit=max&w=1600&q=90)、[二枚目](https://images.unsplash.com/photo-1741217531361-b9f5ecbb6fe2?auto=format&fit=max&w=1600&q=90)。2026-10-13 に Unsplash から取得し、上記の同梱テスト画像とは別に検証しました。
+
+公式リポジトリに従って SAM 3 のソース、`sam3.pt`、依存関係を用意し、`models/ultralytics/bbox/face_yolov8m.pt` のある ComfyUI 環境で、本リポジトリのルートから実行してください：
+
+```bash
+python tests/person_e2e/sam3_person_check.py \
+  --image /path/to/photo.jpg --checkpoint /path/to/sam3.pt \
+  --sam3-root /path/to/sam3 --comfy-root /path/to/ComfyUI \
+  --output /path/to/results --device cpu --prompts man woman
+```
+
+[検証スクリプト](tests/person_e2e/sam3_person_check.py) はマスク、切り抜き、比較画像、`report.json` を保存します。CPU モードの三つの互換処理は隔離した SAM 3 ソースのコピーにだけ適用し、インストール済みパッケージは変更しません。GPU メモリが十分なら `--device cuda` を使えます。この二つのプロンプトは今回の写真に合わせたもので、別の場面では説明の調整と目視確認が必要です。
+
 ## Person ノード リファレンス
 
   * `Person Detector (SEGS)` — 画像内のすべての人物とすべての顔を検出し、各々の顔を所属する身体に対応付け（対応する身体がない顔には近似の身体ボックスを合成）、小さすぎる人物・背景に遠い人物・ボケすぎた人物を除外したうえで、残りを左から右へ採番します（`sort_by` で変更可能）。
     * 必須: `image`、`person_detector`、`face_detector`（いずれも `BBOX_DETECTOR`。例: `UltralyticsDetectorProvider` に `segm/person_yolov8m-seg.pt` と `bbox/face_yolov8m.pt` を指定）。接続されたすべての検出器（身体・SEGM・追加人体・頭部・顔）に共通の `threshold` が適用されます。
     * 任意 `person_segm_detector`（`SEGM_DETECTOR`。例: `person_detector` と同じ `UltralyticsDetectorProvider` の `SEGM_DETECTOR` 出力）: 接続すると身体検出がインスタンスセグメンテーションに切り替わり、各人物の全身領域が矩形ではなく実際のシルエットになります。これは `person_detector` を置き換え、`person_detector` は無視されます。
     * 任意 `extra_person_detector`（`BBOX_DETECTOR`）と `head_detector`（`BBOX_DETECTOR`）: `extra_person_detector` は先に実行される追加の人体検出器です（アニメ・イラストには `bbox/person_detect_v1.1_m.pt` を推奨）。`person_segm_detector`／`person_detector` のボックスは、そこで取りこぼした人物の補完にのみ使われます。`head_detector`（`bbox/head_detect_v2.0_s_yv11.pt` を推奨）は頭部を検出し、顔が見えない人物の採番基準・プレビューのラベル位置・SAM のプロンプト点を決めます。接続すると `min_relative_size` の比較対象も変わります。どちらのモデルも Hugging Face ユーザー [deepghs](https://huggingface.co/deepghs) 提供（MIT ライセンス）です。`models/ultralytics/bbox/` にダウンロードし、`UltralyticsDetectorProvider` が読み込めるよう `ComfyUI/user/default/ComfyUI-Impact-Subpack/model-whitelist.txt` にファイル名を追記してください。
-    * 任意 `sam_model`（`SAM_MODEL`）: 採番された人物ごとに SAM を 1 回実行して身体マスクを精密化します。その人物の顔（顔が見えない場合は頭）を正の点、身体ボックス内に顔が入っている他の人物の顔（または頭）を負の点として使います。その人物自身の顔／頭の領域に入る負の点はスキップされるため、SAM が本人の顔を除外してしまうことはありません。
+    * 任意 `sam_model`（`SAM_MODEL`）: 本人の顔（なければ頭）を正の点、他の採番済み人物の顔／頭を負の点として身体マスクを精密化します。隣人の頭が身体ボックスの外でも、腕や胴体が重なる可能性があるため負の点に含めます。本人の顔／頭内の負の点はスキップします。SAM の候補は合成せず、すべての正負の点を満たす最大の候補を選び、身体ボックス内に切り取ります。該当候補がなければ検出器のマスクを使います。
     * 除外しきい値と既定値: `min_person_ratio` 0.015（身体ボックスの面積と画像全体の比）、`min_relative_size` 0.31（背景の通行人を除外。人物ごとに判定し、その人物の頭が検出されていれば頭の短辺と最大の頭の比、なければ顔の短辺と最大の顔の比、どちらもなければ身体面積と最大人物の比の平方根）、`min_face_size` 24px（顔ボックスの短辺）、`min_sharpness` 0 = 無効（顔切り抜きのラプラシアン分散。ボケた背景人物を除外）。
     * 保存済みの v1 ワークフローは以前のウィジェット値（`min_person_ratio` 0.02、`min_relative_size` 0.25）のままです。サイズ尺度が線形になったため、0.015 / 0.31 に更新してください。
-    * 出力は `persons`（`PERSONS`。`Person Selector` へ渡します）と `preview`（`IMAGE`）: 採番された各人物の全身マスクが、その番号の色で半透明に画像へ重ねられ、番号ラベルが顔（または頭）の上に置かれます。ある人物のマスクからは、他のすべての**採番済み**人物の顔領域（15% 拡張）— 顔が見えない場合は頭部領域 — が自動的に取り除かれるため、身体が重なっていても互いに干渉しません。除外された人物は差し引きの対象外です。除外された人物にはマスクではなく灰色のボックスが表示され、`xS`（小さい）、`xBG`（背景）、`xF`（顔が小さい）、`xB`（ボケ）のタグが付きます。
+    * 出力は `persons`（`PERSONS`。`Person Selector` へ渡します）と `preview`（`IMAGE`）: 身体マスクを番号の色で表示し、顔／頭の上にラベルを置きます。隣人の顔／頭領域（15% 拡張）を除去しますが、検出した二つの輪郭の間では隣人のマスクも覆う画素だけを除去し、本人の髪や腕を保持します。残りの共有画素は、本人の顔／頭、合成矩形より検出済みの身体を優先し、最も近い顔／頭の中心（なければマスクの中心）で一人に割り当てます。顔と身体の対応付けでは輪郭の被覆をボックスの重なりより優先します。空になった身体マスクは空のままですが、顔は別途選択できます。矩形のみでは実際の遮蔽境界を推定できません。除外された人物は差し引きの対象外で、灰色のボックスと `xS`（小さい）、`xBG`（背景）、`xF`（顔が小さい）、`xB`（ボケ）のタグが表示されます。
     * 採番（`sort_by`）: 既定の `left_to_right` は顔の中心で並べ、顔がなければ頭の中心、どちらもなければ身体ボックスの中心を使います。
   * `Person Selector` — `Person Detector (SEGS)` が採番した人物の中から一部を選び、その顔と身体の領域を SEGS として出力します。そのまま `Detailer (SEGS)` に渡せます。
     * `index`: 1 から始まるカンマ区切りの番号。例: `2`、`1,3`、`2-4`、最後の人物は `-1`。空にすると全員が選ばれます。

@@ -93,16 +93,41 @@ LoadImage ───────────────────────�
 
 侧脸、被严重遮挡、或者只有几十像素大小的脸，是这套节点的薄弱环节 —— 对原版 `FaceDetailer` 同样如此。应对办法：调低 `denoise`、不要在提示词里要求裁剪区域根本看不到的特征，或者干脆不选这些人。
 
+## 人物重叠：本次修复与限制
+
+身体蒙版现在会把共享像素分给唯一的已编号人物，分空后保持为空；脸与身体的关联优先看轮廓覆盖，再看框的重合。SAM 候选只选一个，不再合并多个备选。这些改动能避免节点重新引入共享蒙版，但几何分配不能还原交叉手臂或腿部的真实边界。
+
+一张下载的拥抱照片中，`person_yolov8m-seg.pt` 对两个已检测到的脸只给出一个身体实例。因此，接上 `person_segm_detector` 不代表一定能把两个人分开，SAM 1 细化也未解决这个例子。我们另外测试了 [SAM 3](https://github.com/facebookresearch/sam3)，分别使用 `man`、`woman` 文本提示：下面两张照片都得到两份独立的可见人物轮廓。脚本把这些蒙版送入实际 Detector → Selector 节点，验证共享像素为 0，导出的蒙版保持一致。这是分割实验，尚未接成内置 SAM 3 加载节点，也没有运行 Detailer 重绘；不能照这个例子通过现有 `SAMLoader` 接入 SAM 3。
+
+从左到右：原图、Detector 预览、人物 1、人物 2。被遮挡的身体部分不会补全；第二张仍有少量边缘碎片，尚未做像素级真值精度评测。
+
+![拥抱照片：SAM 3 分离弯曲腿部和交叉手臂](docs/images/person-overlap-sam3-first.jpg)
+
+![拥抱照片：只有一个可见脸，仍输出两份身体蒙版](docs/images/person-overlap-sam3-second.jpg)
+
+图片来源：[第一张](https://images.unsplash.com/photo-1575216525169-112eb232f906?auto=format&fit=max&w=1600&q=90)、[第二张](https://images.unsplash.com/photo-1741217531361-b9f5ecbb6fe2?auto=format&fit=max&w=1600&q=90)，于 2026-10-13 从 Unsplash 下载，与上面的仓库测试图示例分别验证。
+
+复现时，按官方仓库准备 SAM 3 源码、`sam3.pt` 权重及依赖，并准备带有 `models/ultralytics/bbox/face_yolov8m.pt` 的 ComfyUI 环境。在本仓库根目录运行：
+
+```bash
+python tests/person_e2e/sam3_person_check.py \
+  --image /path/to/photo.jpg --checkpoint /path/to/sam3.pt \
+  --sam3-root /path/to/sam3 --comfy-root /path/to/ComfyUI \
+  --output /path/to/results --device cpu --prompts man woman
+```
+
+[验证脚本](tests/person_e2e/sam3_person_check.py) 会保存独立蒙版、抠图、对比图和 `report.json`。CPU 模式只在隔离的 SAM 3 源码副本中应用三处兼容处理，不修改已安装的包。显存充足时可用 `--device cuda`。这两个文本提示针对本次照片，其他场景需要调整描述并检查分割结果。
+
 ## Person 节点说明
 
   * `Person Detector (SEGS)` —— 检测画面里所有人和所有脸，把每张脸和它所属的身体关联起来（找不到身体时，会为这张脸合成一个近似的身体框），排除太小的、太靠后景的、太模糊的人，剩下的从左到右编号（可通过 `sort_by` 调整）。
     * 必填：`image`、`person_detector` 和 `face_detector`（都是 `BBOX_DETECTOR`，例如用 `UltralyticsDetectorProvider` 加载 `segm/person_yolov8m-seg.pt` 和 `bbox/face_yolov8m.pt`）。所有接上的检测器（身体、SEGM、额外人体、头部、脸）共用同一个 `threshold`。
     * 可选 `person_segm_detector`（`SEGM_DETECTOR`，例如与 `person_detector` 同一个 `UltralyticsDetectorProvider` 的 `SEGM_DETECTOR` 输出）：接上后身体检测切换为实例分割，每个人的全身区域是真实轮廓而不是矩形；它会取代 `person_detector`，后者将被忽略。
     * 可选 `extra_person_detector`（`BBOX_DETECTOR`）和 `head_detector`（`BBOX_DETECTOR`）：`extra_person_detector` 是优先运行的额外人体检测器（动漫/插画推荐 `bbox/person_detect_v1.1_m.pt`），`person_segm_detector`/`person_detector` 的框只用来补它漏掉的人。`head_detector`（推荐 `bbox/head_detect_v2.0_s_yv11.pt`）检测头部，为看不到脸的人提供编号锚点、预览标签位置和 SAM 提示点；接上之后，`min_relative_size` 的比较对象也会随之改变。两个模型都来自 Hugging Face 用户 [deepghs](https://huggingface.co/deepghs)（MIT 协议）—— 下载到 `models/ultralytics/bbox/`，并把文件名加进 `ComfyUI/user/default/ComfyUI-Impact-Subpack/model-whitelist.txt`，`UltralyticsDetectorProvider` 才会加载它们。
-    * 可选 `sam_model`（`SAM_MODEL`）：为每个已编号的人跑一次 SAM 来细化身体蒙版，用这个人的脸（看不到脸时用头）作为正向点，用身体框内其他人的脸（或头）作为负向点；落在此人自己脸/头区域内的负向点会被跳过，以免让 SAM 把他自己的脸排除掉。
+    * 可选 `sam_model`（`SAM_MODEL`）：用此人的脸（看不到脸时用头）作为正向点，其他已编号者的脸/头作为负向点，细化身体蒙版。邻居的头即使在身体框外，其肢体也可能交叠，因此仍提供负向点；落在自己的脸/头区域内的负向点会跳过。SAM 的多个候选不会合并：选取满足全部正负提示的最大候选，并裁到身体框内；没有合格候选时使用检测器蒙版。
     * 排除阈值与默认值：`min_person_ratio` 0.015（身体框面积占全图的比例）、`min_relative_size` 0.31（过滤背景路人 —— 逐人判定：该人检测到头就用头的短边比最大的头，否则用脸的短边比最大的脸，再否则用身体面积比最大者的平方根）、`min_face_size` 24 像素（脸框短边）、`min_sharpness` 0 表示关闭（脸部裁剪的拉普拉斯方差，用于过滤模糊的背景人物）。
     * 存过的 v1 工作流会沿用旧的控件值（`min_person_ratio` 0.02、`min_relative_size` 0.25）；由于尺寸度量改成了线性方式，请改为 0.015 / 0.31。
-    * 输出 `persons`（`PERSONS`，接给 `Person Selector`）和 `preview`（`IMAGE`）：每个已编号者的全身蒙版以半透明形式叠在原图上，用其编号对应的颜色着色，编号标签放在脸（或头）的上方；某人的蒙版会自动挖掉其他**已编号**者（外扩 15% 的）脸部区域 —— 看不到脸时则是头部区域 —— 这样身体重叠时不会互相渗透；被排除的人不参与挖除。被排除者显示为灰框而非蒙版，并标注 `xS`（太小）、`xBG`（背景）、`xF`（脸太小）或 `xB`（太模糊）。
+    * 输出 `persons`（`PERSONS`，接给 `Person Selector`）和 `preview`（`IMAGE`）：每人的身体蒙版按编号配色，标签放在脸/头上方。蒙版先挖掉邻居外扩 15% 的脸/头区域；两个检测轮廓之间只挖除邻居蒙版也覆盖的像素，保留自己的头发和手臂。剩余身体交叠像素分给唯一的人：优先保留自己的脸/头、优先检测到的身体而非合成矩形，其余按最近的脸/头中心（没有时用蒙版中心）分配。脸与身体的关联优先看轮廓覆盖，再看框的重合。身体蒙版分空后保持为空，脸仍可单独选择。只有矩形时，这种几何分配无法还原真实遮挡边界。被排除的人不参与挖除，显示为灰框，并标注 `xS`（太小）、`xBG`（背景）、`xF`（脸太小）或 `xB`（太模糊）。
     * 编号方式（`sort_by`）：默认 `left_to_right` 按脸的中心排序，没有脸时退回头的中心，两者都没有时用身体框的中心。
   * `Person Selector` —— 从 `Person Detector (SEGS)` 编号过的人里选出一部分，把他们的脸和身体区域作为 SEGS 输出，可直接接 `Detailer (SEGS)`。
     * `index`：从 1 开始、用逗号分隔的编号，例如 `2`、`1,3`、`2-4`，或用 `-1` 表示最后一个人；留空表示选所有人。
